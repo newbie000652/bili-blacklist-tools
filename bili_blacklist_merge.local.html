@@ -1,0 +1,417 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>一次性：B站黑名单合并工具（本地，通用输入版）</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body{font-family: system-ui, "Segoe UI", Roboto, "Helvetica Neue", Arial; max-width:980px;margin:18px auto;padding:18px;}
+    h1{font-size:1.25rem;margin-bottom:6px;}
+    p.small{color:#666;margin-top:4px;margin-bottom:12px;}
+    .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px;}
+    select,input[type=file],button{padding:8px;border-radius:6px;border:1px solid #ccc;background:white;}
+    button{cursor:pointer;}
+    .box{border:1px solid #ddd;border-radius:8px;padding:12px;background:#fafafa;margin-bottom:12px;}
+    pre{white-space:pre-wrap;background:#fff;border:1px solid #eee;padding:10px;border-radius:6px;max-height:320px;overflow:auto;}
+    table{width:100%;border-collapse:collapse;}
+    td,th{border:1px solid #eee;padding:6px;text-align:left;font-size:0.9rem;}
+    .muted{color:#666;font-size:0.9rem;}
+    .tag{display:inline-block;padding:2px 6px;border-radius:999px;background:#eef;border:1px solid #dde;margin-left:6px;font-size:12px;color:#445;}
+  </style>
+</head>
+<body>
+  <h1>一次性：B站黑名单合并工具（本地，通用输入版）<span class="tag">v1.1</span></h1>
+  <p class="small">本工具仅在本地浏览器运行，不会上传数据。<br>
+  <strong>支持输入格式：</strong>
+  <ul>
+    <li>你的导出脚本生成的 <code>simplified</code> 数组：<code>[{mid, uname, mtime_iso, ...}, ...]</code></li>
+    <li>B 站 API 原始响应：<code>{ data: { list:[{mid, uname, mtime, ...}], total } }</code></li>
+    <li>合并器标准格式：<code>{ meta, items:[{uid, primary_uname, added_at, ...}] }</code></li>
+    <li>纯 UID 列表：<code>[123, 456, "789", ...]</code></li>
+  </ul>
+  输出为：<code>{ meta, items:[{uid, primary_uname, unames[], notes[], added_at_first, added_at_last, occurrences, sources[]}] }</code></p>
+
+  <div class="box">
+    <div class="row">
+      <input id="fileInput" type="file" multiple accept=".json" />
+      <button id="pasteBtn">粘贴 JSON 文本（弹窗）</button>
+      <select id="mode">
+        <option value="union">并集（union）</option>
+        <option value="intersection">交集（intersection）</option>
+        <option value="difference">差集：第1个文件 - 其它</option>
+      </select>
+      <select id="conflict">
+        <option value="merge">冲突：保留并列信息（merge）</option>
+        <option value="latest">冲突：以最新 uname 为主</option>
+        <option value="earliest">冲突：以最早 uname 为主</option>
+        <option value="preferFirst">冲突：以第一个文件为准</option>
+      </select>
+      <button id="mergeBtn">合并并预览</button>
+    </div>
+
+    <div class="row" style="margin-top:8px;">
+      <button id="downloadJsonBtn" disabled>下载合并 JSON</button>
+      <button id="downloadCsvBtn" disabled>下载 CSV (uid,uname)</button>
+      <button id="copyUidsBtn" disabled>复制 UID 列表（换行）</button>
+      <button id="clearBtn">清除已载入</button>
+      <div class="muted" style="margin-left:auto" id="stats">未加载文件</div>
+    </div>
+  </div>
+
+  <div class="box">
+    <strong>已加载文件：</strong>
+    <div id="filesArea" class="muted">（请选择或拖入 JSON 文件）</div>
+  </div>
+
+  <div class="box">
+    <strong>合并结果 / 预览：</strong>
+    <div id="logArea" style="margin-top:6px"><em class="muted">点击“合并并预览”后显示</em></div>
+  </div>
+
+  <div class="box">
+    <details>
+      <summary>使用说明（点开）</summary>
+      <ol>
+        <li>把别人导出的 JSON 或自己导出的文件拖进或选择到页面（本地处理）。</li>
+        <li>可混合不同格式；工具会自动识别并转换成统一结构。</li>
+        <li>选择合并模式与冲突策略，点击“合并并预览”。</li>
+        <li>合并完成后可下载合并 JSON、导出 CSV，或复制 UID 列表用于导入脚本。</li>
+      </ol>
+    </details>
+  </div>
+
+  <script>
+  // ---------- 统一格式适配：将任意输入转换为 {items:[{uid, primary_uname, added_at, note?}]} ----------
+  function tsToIso(ts){ if (!ts) return null; try{ return new Date(ts).toISOString().replace('T',' ').slice(0,19); }catch{ return null; } }
+  function secToIso(sec){ if (!sec) return null; return tsToIso(sec*1000); }
+
+  function normalizePayloadAny(obj, filename='unknown'){  
+    // Already standard { items: [...] }
+    if (obj && Array.isArray(obj.items)) {
+      const items = obj.items.map(x => ({
+        uid: Number(x.uid ?? x.id ?? x.mid),
+        primary_uname: x.primary_uname ?? x.uname ?? null,
+        unames: Array.isArray(x.unames) ? x.unames.slice(0, 10) : (x.uname ? [x.uname] : []),
+        notes: Array.isArray(x.notes) ? x.notes.slice(0, 10) : [],
+        added_at_first: x.added_at_first ?? x.added_at ?? null,
+        added_at_last: x.added_at_last ?? x.added_at ?? null
+      })).filter(it => Number.isFinite(it.uid));
+      return { meta: obj.meta || { source: filename }, items };
+    }
+
+    // API 原始：{ data: { list:[{mid, uname, mtime, ...}] } }
+    if (obj && obj.data && Array.isArray(obj.data.list)) {
+      const items = obj.data.list.map(it => ({
+        uid: Number(it.mid),
+        primary_uname: it.uname || null,
+        unames: it.uname ? [it.uname] : [],
+        notes: [],
+        added_at_first: secToIso(it.mtime) || null,
+        added_at_last: secToIso(it.mtime) || null
+      })).filter(it => Number.isFinite(it.uid));
+      return { meta: { source: filename, detected: 'api_data_list' }, items };
+    }
+
+    // 你的导出脚本 simplified：[{mid, uname, mtime_iso, ...}]
+    if (Array.isArray(obj) && obj.length && typeof obj[0] === 'object' && (obj[0].mid || obj[0].uid || obj[0].id)) {
+      const items = obj.map(it => ({
+        uid: Number(it.mid ?? it.uid ?? it.id),
+        primary_uname: it.uname || null,
+        unames: it.uname ? [it.uname] : [],
+        notes: it.note ? [String(it.note)] : [],
+        added_at_first: it.mtime_iso || it.added_at || null,
+        added_at_last: it.mtime_iso || it.added_at || null
+      })).filter(it => Number.isFinite(it.uid));
+      return { meta: { source: filename, detected: 'array_of_objects' }, items };
+    }
+
+    // 纯 UID 列表：[123, "456", ...]
+    if (Array.isArray(obj) && obj.length && (typeof obj[0] === 'string' || typeof obj[0] === 'number')) {
+      const items = obj.filter(Boolean).map(x => ({ uid: Number(x), primary_uname: null, unames: [], notes: [], added_at_first: null, added_at_last: null }))
+        .filter(it => Number.isFinite(it.uid));
+      return { meta: { source: filename, detected: 'array_of_ids' }, items };
+    }
+
+    throw new Error('无法识别的输入结构');
+  }
+
+  // ---------- 合并函数（和你之前版本兼容） ----------
+  function mergeBlacklists(parsedFiles, options = {}) {
+    const opts = Object.assign({ mode: 'union', conflict: 'merge', timeField: 'added_at_last' }, options);
+    function toTime(t) { if (!t) return null; const d = new Date(t); return isNaN(d.getTime()) ? null : d.getTime(); }
+
+    const fileUidSets = parsedFiles.map(f => {
+      const set = new Set();
+      (f.payload && f.payload.items || []).forEach(it => { if (it && Number.isFinite(it.uid)) set.add(String(it.uid)); });
+      return set;
+    });
+
+    const merged = new Map();
+    const invalidItems = [];
+
+    for (let fileIndex = 0; fileIndex < parsedFiles.length; fileIndex++) {
+      const { filename } = parsedFiles[fileIndex];
+      const items = (parsedFiles[fileIndex].payload && parsedFiles[fileIndex].payload.items) || [];
+      for (const raw of items) {
+        if (!raw || !Number.isFinite(raw.uid)) { invalidItems.push({ filename, raw }); continue; }
+        const uid = String(raw.uid);
+        const existing = merged.get(uid);
+        if (!existing) {
+          merged.set(uid, {
+            uid: Number(uid),
+            primary_uname: raw.primary_uname || null,
+            unames: Array.isArray(raw.unames) ? raw.unames.slice(0, 10) : [],
+            notes: Array.isArray(raw.notes) ? raw.notes.slice(0, 10) : [],
+            added_at_first: raw.added_at_first || null,
+            added_at_last: raw.added_at_last || null,
+            sources: [{ file: filename, example_uname: raw.primary_uname || null }],
+            occurrences: 1
+          });
+        } else {
+          existing.occurrences = (existing.occurrences || 0) + 1;
+          existing.sources.push({ file: filename, example_uname: raw.primary_uname || null });
+          // 合并别名
+          if (raw.unames) for (const nm of raw.unames) if (nm && !existing.unames.includes(nm)) existing.unames.push(nm);
+          // 合并备注
+          if (raw.notes) for (const nt of raw.notes) if (nt && !existing.notes.includes(nt)) existing.notes.push(nt);
+          // 时间
+          const tFirst = toTime(existing.added_at_first);
+          const tLast  = toTime(existing.added_at_last);
+          const cFirst = toTime(raw.added_at_first);
+          const cLast  = toTime(raw.added_at_last);
+          if (!tFirst || (cFirst && cFirst < tFirst)) existing.added_at_first = raw.added_at_first || existing.added_at_first;
+          if (!tLast  || (cLast  && cLast  > tLast )) existing.added_at_last  = raw.added_at_last  || existing.added_at_last;
+          // 主名冲突
+          if (existing.primary_uname && raw.primary_uname && raw.primary_uname !== existing.primary_uname) {
+            if (opts.conflict === 'latest') {
+              if (cLast && (!tLast || cLast > tLast)) existing.primary_uname = raw.primary_uname;
+            } else if (opts.conflict === 'earliest') {
+              if (cFirst && (!tFirst || cFirst < tFirst)) existing.primary_uname = raw.primary_uname;
+            } else if (opts.conflict === 'preferFirst') {
+              // 保持不变
+            } else {
+              // merge：不改主名
+            }
+          } else if (!existing.primary_uname && raw.primary_uname) {
+            existing.primary_uname = raw.primary_uname;
+          }
+        }
+      }
+    }
+
+    let finalEntries = Array.from(merged.values());
+    if (opts.mode === 'intersection' && parsedFiles.length > 0) {
+      finalEntries = finalEntries.filter(e => fileUidSets.every(s => s.has(String(e.uid))));
+    } else if (opts.mode === 'difference' && parsedFiles.length >= 2) {
+      const firstSet = fileUidSets[0];
+      const othersUnion = new Set();
+      for (let i = 1; i < fileUidSets.length; i++) for (const u of fileUidSets[i]) othersUnion.add(u);
+      finalEntries = finalEntries.filter(e => firstSet.has(String(e.uid)) && !othersUnion.has(String(e.uid)));
+    }
+
+        // --- 在 mergeBlacklists 内部，最后部分替换为下面 ---
+    const mergedPayload = {
+      meta: {
+        tool: 'bili-blacklist-merge',
+        version: '1.1',
+        merged_at: new Date().toISOString(),
+        sources: parsedFiles.map(p => p.filename || 'unknown')
+      },
+      // 用于再次合并 / 机器可读的内部格式（保留全部信息）
+      items: finalEntries
+    };
+
+    // 构造两种兼容导入的导出格式
+    // 1) exportArray: 与你导出脚本类似的 simplified 数组（对象形式），方便直接导入到你的导入脚本
+    // 2) uids: 纯 UID 列表，导入脚本也支持
+    function toUnix(tsStr) {
+      if (!tsStr) return 0;
+      const t = Date.parse(tsStr);
+      if (isNaN(t)) return 0;
+      return Math.floor(t / 1000);
+    }
+
+    const exportArray = finalEntries.map(it => {
+      const mtime_unix = toUnix(it.added_at_last || it.added_at_first) || 0;
+      const mtime_iso = it.added_at_last || it.added_at_first || '';
+      return {
+        mid: Number(it.uid),
+        uname: it.primary_uname || (it.unames && it.unames[0]) || '',
+        // face / sign / attribute 若无可信值，置空或保守默认（保持与导出格式字段一致）
+        face: null,
+        sign: null,
+        attribute: 128,
+        mtime_unix,
+        mtime_iso
+      };
+    });
+
+    const uids = finalEntries.map(it => Number(it.uid));
+
+    // 将兼容导出内容嵌入 mergedPayload 下，方便直接下载或被其他工具识别
+    mergedPayload.export = exportArray;
+    mergedPayload.uids = uids;
+
+    return { mergedPayload, invalidItems };
+
+  }
+
+  // ---------- 辅助：下载、CSV、复制 ----------
+  function downloadBlob(filename, content, type='application/json') {
+    const blob = new Blob([content], { type });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href = url; a.download = filename; a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+  function toCsv(items) {
+    const rows = [['uid','primary_uname']];
+    for (const it of items) rows.push([String(it.uid), it.primary_uname ? String(it.primary_uname).replace(/"/g,'""') : '']);
+    return rows.map(r => r.map(v => `"${v}"`).join(',')).join('\n');
+  }
+
+  // ---------- UI 逻辑 ----------
+  const fileInput = document.getElementById('fileInput');
+  const pasteBtn = document.getElementById('pasteBtn');
+  const mergeBtn = document.getElementById('mergeBtn');
+  const filesArea = document.getElementById('filesArea');
+  const logArea = document.getElementById('logArea');
+  const stats = document.getElementById('stats');
+  const downloadJsonBtn = document.getElementById('downloadJsonBtn');
+  const downloadCsvBtn = document.getElementById('downloadCsvBtn');
+  const copyUidsBtn = document.getElementById('copyUidsBtn');
+  const clearBtn = document.getElementById('clearBtn');
+
+  let loadedFiles = []; // { filename, payload } or { filename, error }
+
+  fileInput.addEventListener('change', e => handleFiles(e.target.files));
+  pasteBtn.addEventListener('click', () => {
+    const txt = prompt('在此粘贴单个或多个 JSON（多个时可用数组包裹），或粘贴单个文件文本：');
+    if (!txt) return;
+    try {
+      const parsed = JSON.parse(txt);
+      if (Array.isArray(parsed)) {
+        parsed.forEach((p, idx) => {
+          try { const norm = normalizePayloadAny(p, `pasted_${idx+1}.json`); loadedFiles.push({ filename: `pasted_${idx+1}.json`, payload: norm }); }
+          catch (e) { loadedFiles.push({ filename: `pasted_${idx+1}.json`, error: e.message }); }
+        });
+      } else {
+        try { const norm = normalizePayloadAny(parsed, `pasted_${loadedFiles.length+1}.json`); loadedFiles.push({ filename: `pasted_${loadedFiles.length+1}.json`, payload: norm }); }
+        catch (e) { loadedFiles.push({ filename: `pasted_${loadedFiles.length+1}.json`, error: e.message }); }
+      }
+      refreshFilesArea();
+    } catch (e) {
+      alert('解析失败：请确认 JSON 格式正确。错误：' + e.message);
+    }
+  });
+
+  function handleFiles(fileList) {
+    const arr = Array.from(fileList || []);
+    if (arr.length === 0) return;
+    Promise.all(arr.map(f => f.text().then(t => {
+      try { const norm = normalizePayloadAny(JSON.parse(t), f.name); return { filename: f.name, payload: norm }; }
+      catch (e) { return { filename: f.name, error: e.message }; }
+    }))).then(results => {
+      loadedFiles = loadedFiles.concat(results);
+      refreshFilesArea();
+    });
+  }
+
+  function refreshFilesArea() {
+    if (!loadedFiles || loadedFiles.length === 0) { filesArea.textContent = '（未加载）'; stats.textContent = '未加载文件'; return; }
+    const lines = loadedFiles.map((f, idx) => {
+      if (f.error) return `<div style="color:#c00">[${idx+1}] ${f.filename} — 解析失败：${f.error}</div>`;
+      const count = (f.payload && f.payload.items && f.payload.items.length) || 0;
+      const tag = f.payload && f.payload.meta && f.payload.meta.detected ? `<span class="tag">${f.payload.meta.detected}</span>` : '';
+      return `<div>[${idx+1}] ${f.filename} — ${count} 条 ${tag}</div>`;
+    });
+    filesArea.innerHTML = lines.join('');
+    stats.textContent = `${loadedFiles.length} 个文件已加载`;
+  }
+
+  mergeBtn.addEventListener('click', () => {
+    const good = loadedFiles.filter(f => !f.error);
+    if (!good.length) return alert('没有可用的已解析文件。');
+    const mode = document.getElementById('mode').value;
+    const conflict = document.getElementById('conflict').value;
+    const parsed = good.map(r => ({ filename: r.filename, payload: r.payload }));
+    const { mergedPayload, invalidItems } = mergeBlacklists(parsed, { mode, conflict });
+
+    // 显示统计与预览
+    const total = mergedPayload.items.length;
+    const topPreview = mergedPayload.items.slice(0, 40);
+    let html = `<div>合并完成：<strong>${total}</strong> 条 (无效条目 ${invalidItems.length})</div>`;
+    if (invalidItems.length) {
+      html += `<details style="margin-top:6px"><summary style="cursor:pointer">查看无效条目 (${invalidItems.length})</summary><pre>${JSON.stringify(invalidItems.slice(0,50), null, 2)}</pre></details>`;
+    }
+    html += `<details style="margin-top:8px"><summary style="cursor:pointer">预览（前 ${topPreview.length} 条）</summary><pre>${JSON.stringify(topPreview, null, 2)}</pre></details>`;
+    // occurrences top 10
+    const topOcc = mergedPayload.items.slice().sort((a,b)=> (b.occurrences||0)-(a.occurrences||0)).slice(0,10);
+    if (topOcc.length) {
+      html += `<div style="margin-top:10px"><strong>出现次数最多（top ${topOcc.length}）</strong><table><thead><tr><th>uid</th><th>次数</th><th>primary_uname</th></tr></thead><tbody>${topOcc.map(it=>`<tr><td>${it.uid}</td><td>${it.occurrences||1}</td><td>${it.primary_uname||''}</td></tr>`).join('')}</tbody></table></div>`;
+    }
+    logArea.innerHTML = html;
+
+    // enable actions
+    downloadJsonBtn.disabled = false;
+    downloadCsvBtn.disabled = false;
+    copyUidsBtn.disabled = false;
+
+    // attach data to buttons
+        // 假设 mergedPayload 在闭包中可见（来自上一步 mergeBlacklists 返回值）
+    downloadJsonBtn.onclick = () => {
+      // 让用户选择想下载的格式
+      // 三种选项：1 合并标准（meta+items） 2 导入格式（array of objects with mid） 3 纯 uid 列表
+      const choice = prompt('请选择要下载的 JSON 格式：\n1 = 合并标准（meta+items，适合再次合并）\n2 = 导入兼容（array of objects，含 mid/uname，可直接用于导入脚本）\n3 = 纯 UID 列表（["123","456"]）\n请输入 1/2/3（默认 2）') || '2';
+      const now = new Date().toISOString().slice(0,19).replace(/[:T]/g,'-');
+      if (choice === '1') {
+        const name = `bili_merged_blacklist_meta_items_${now}.json`;
+        downloadBlob(name, JSON.stringify(mergedPayload, null, 2), 'application/json');
+      } else if (choice === '3') {
+        const name = `bili_merged_blacklist_uids_${now}.json`;
+        downloadBlob(name, JSON.stringify(mergedPayload.uids || mergedPayload.items.map(i=>i.uid), null, 2), 'application/json');
+      } else { // default: 2
+        const name = `bili_merged_blacklist_export_${now}.json`;
+        downloadBlob(name, JSON.stringify(mergedPayload.export || mergedPayload.items.map(i=>({
+          mid: i.uid,
+          uname: i.primary_uname || (i.unames && i.unames[0]) || '',
+          face: null,
+          sign: null,
+          attribute: 128,
+          mtime_unix: (i.added_at_last ? Math.floor(new Date(i.added_at_last).getTime()/1000) : 0),
+          mtime_iso: i.added_at_last || i.added_at_first || ''
+        })), null, 2), 'application/json');
+      }
+    };
+
+    downloadCsvBtn.onclick = () => {
+      const csv = toCsv(mergedPayload.items);
+      downloadBlob('bili_merged_blacklist.csv', csv, 'text/csv;charset=utf-8;');
+    };
+    copyUidsBtn.onclick = async () => {
+      const uids = mergedPayload.items.map(it => String(it.uid)).join('\n');
+      try { await navigator.clipboard.writeText(uids); alert('已复制 ' + mergedPayload.items.length + ' 个 UID 到剪贴板（换行分隔）。'); }
+      catch (e) {
+        const ta = document.createElement('textarea'); ta.value = uids; document.body.appendChild(ta); ta.select();
+        try { document.execCommand('copy'); alert('已复制（兼容模式）'); } catch (_) { prompt('请手动复制以下 UID：', uids); }
+        ta.remove();
+      }
+    };
+  });
+
+  clearBtn.addEventListener('click', () => {
+    if (!confirm('确认清除已加载的文件吗？')) return;
+    loadedFiles = [];
+    refreshFilesArea();
+    logArea.innerHTML = '<em class="muted">已清除</em>';
+    downloadJsonBtn.disabled = true; downloadCsvBtn.disabled = true; copyUidsBtn.disabled = true;
+  });
+
+  // drag & drop support
+  document.addEventListener('dragover', e => e.preventDefault());
+  document.addEventListener('drop', e => { e.preventDefault(); if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) handleFiles(e.dataTransfer.files); });
+
+  // init
+  refreshFilesArea();
+  </script>
+</body>
+</html>
